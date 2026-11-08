@@ -1,0 +1,15 @@
+{
+  "project": {
+    "name": "Task Manager REST API",
+    "repoInitialized": true,
+    "initialCommit": "75236d7"
+  },
+  "lastUpdated": "2026-08-02T00:00:00Z",
+  "activeTasks": [],
+  "completedTasks": [],
+  "agents": {
+    "explain": "Beginner-friendly interactive code explainer; walks through files/diffs one piece at a time and saves full explanations to docs/explain/."
+  },
+  "lastReview": null,
+  "reviewHistory": []
+}
