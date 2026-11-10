@@ -8,7 +8,7 @@
 # debinstaller_bspwm.v3-report.md.
 #
 # Steps:
-#   1. Update the system and install packages
+#   1. Optionally migrate to Debian testing/unstable, update, install packages
 #   2. Install the Iosevka Nerd Font from the upstream release
 #   3. Build and install lemonbar-xft from source
 #   4. Configure yubikey support
@@ -17,12 +17,15 @@
 #   7. Optionally delete this repository
 #
 # Usage:
-#   ./debinstaller_bspwm.v3.sh [options]
+#   ./debinstaller_bspwm.sh [options]
 #
 #   -y, --yes          answer "yes" to every confirmation prompt
 #       --no-pyenv     skip the pyenv installer
 #       --remove-self  delete ~/Fresh-Installs at the end (destructive)
 #   -h, --help         show this help
+#
+# The Debian suite (stable, testing or unstable) is chosen interactively during
+# the install unless TARGET_SUITE is set in the environment.
 #
 # Exit codes: 0 = success, 1 = error, 2 = bad usage, 130 = interrupted.
 
@@ -57,9 +60,23 @@ ASSUME_YES="${ASSUME_YES:-false}"
 INSTALL_PYENV="${INSTALL_PYENV:-true}"
 REMOVE_SELF="${REMOVE_SELF:-false}"
 
+# Debian suite to provision: stable, testing, or unstable (sid). When empty,
+# the script prompts for a choice during step 1. Set TARGET_SUITE to skip the
+# prompt, for example in unattended runs.
+TARGET_SUITE="${TARGET_SUITE:-}"
+
+# Official mirrors used when replacing the apt sources during a suite
+# migration. Override these to use a local or country mirror.
+DEBIAN_MIRROR="${DEBIAN_MIRROR:-http://deb.debian.org/debian}"
+DEBIAN_SECURITY_MIRROR="${DEBIAN_SECURITY_MIRROR:-http://security.debian.org/debian-security}"
+
+# Set to true when the script changed the apt sources to testing or unstable.
+REBOOT_REQUIRED="${REBOOT_REQUIRED:-false}"
+
 readonly SCRIPT_NAME SCRIPT_DIR
-# ASSUME_YES, INSTALL_PYENV and REMOVE_SELF are deliberately not readonly:
-# the argument parser below updates them.
+# ASSUME_YES, INSTALL_PYENV, REMOVE_SELF, TARGET_SUITE and REBOOT_REQUIRED are
+# deliberately not readonly: the argument parser, the suite prompt and the
+# suite migration update them.
 
 readonly HOME_DIR="${HOME}"
 readonly DOTFILES_DIR="${HOME_DIR}/dotfiles"
@@ -125,6 +142,9 @@ readonly -a PACKAGES=(
   neovim
   ncmpcpp
   mopidy
+  tmux
+  remina
+  fzf
 
   # Fonts, browsers, document and media applications.
   fonts-jetbrains-mono
@@ -159,6 +179,10 @@ readonly -a PACKAGES=(
 # removed for Debian 13 (trixie), where fastfetch is the replacement. Whichever
 # one is known to apt is installed, so the same script works on 12 and 13.
 OPTIONAL_PACKAGES=()
+
+# Extra packages installed only when the chosen suite is testing or unstable.
+# apt-listbugs warns about release-critical bugs before package upgrades.
+SUITE_PACKAGES=()
 
 # Build dependencies for pyenv on Debian (the Void base-devel package does not
 # pull in all of these). Installed only when the pyenv step actually runs.
@@ -214,7 +238,11 @@ Options:
       --remove-self  delete ~/Fresh-Installs at the end (destructive)
   -h, --help         show this help
 
-Environment overrides: ASSUME_YES, INSTALL_PYENV, REMOVE_SELF, LEMONBAR_*.
+The Debian suite (stable, testing or unstable) is chosen interactively during
+the install unless TARGET_SUITE is set in the environment.
+
+Environment overrides: ASSUME_YES, INSTALL_PYENV, REMOVE_SELF, TARGET_SUITE,
+DEBIAN_MIRROR, DEBIAN_SECURITY_MIRROR, LEMONBAR_*.
 EOF
 }
 
@@ -254,7 +282,16 @@ sudo_run() {
 # Run apt-get non-interactively. Setting the variables through `env` makes sure
 # they survive sudo, which strips most of the caller's environment by default.
 apt_get() {
-  sudo_run env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "$@"
+  sudo_run env \
+    DEBIAN_FRONTEND=noninteractive \
+    NEEDRESTART_MODE=a \
+    APT_LISTCHANGES_FRONTEND=none \
+    APT_LISTBUGS_FRONTEND=none \
+    UCF_FORCE_CONFFOLD=1 \
+    apt-get \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    "$@"
 }
 
 # True when stdin and stdout are terminals.
@@ -376,6 +413,225 @@ install_lemonbar_xft() {
   fi
 }
 
+# Upgrade the base system, using a full upgrade when the apt sources were
+# switched to a rolling suite.
+apt_full_upgrade() {
+  if [[ ${TARGET_SUITE} == stable ]]; then
+    apt_get -y upgrade
+    return 0
+  fi
+
+  # A suite migration changes package versions and dependencies, so a plain
+  # upgrade is not enough. Run full-upgrade twice: the first pass can hold
+  # packages back while their dependencies move.
+  apt_get -y full-upgrade
+  apt_get -y full-upgrade
+}
+
+# Install the subset of the given packages that exists in the configured apt
+# sources. Packages missing from the target suite are reported and skipped so
+# one unavailable package cannot fail the whole install.
+install_available_packages() {
+  local -a available=() missing=()
+  local pkg
+
+  for pkg in "$@"; do
+    if apt-cache show "${pkg}" >/dev/null 2>&1; then
+      available+=("${pkg}")
+    else
+      missing+=("${pkg}")
+    fi
+  done
+
+  if ((${#missing[@]} > 0)); then
+    printf '%s: warning: not available on Debian %s, skipping:' \
+      "${SCRIPT_NAME}" "${TARGET_SUITE}" >&2
+    printf ' %s' "${missing[@]}" >&2
+    printf '\n' >&2
+  fi
+
+  if ((${#available[@]} == 0)); then
+    warn "no installable packages left in this group"
+    return 0
+  fi
+
+  apt_get install -y "${available[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Debian suite migration
+# ---------------------------------------------------------------------------
+
+# Print the codename from /etc/os-release, if present.
+debian_codename() {
+  local codename=''
+  if [[ -r /etc/os-release ]]; then
+    codename="$(
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      printf '%s' "${VERSION_CODENAME:-}"
+    )"
+  fi
+  printf '%s\n' "${codename}"
+}
+
+# Print the codename the mirror currently publishes for a suite. Prints nothing
+# when the mirror cannot be reached, so callers can fall back.
+release_codename() {
+  local suite="$1" release
+  release="$(curl -fsSL --retry 2 --retry-delay 1 --max-time 30 \
+    "${DEBIAN_MIRROR}/dists/${suite}/Release" 2>/dev/null)" || return 0
+  awk -F': *' '$1 == "Codename" { print $2; exit }' <<< "${release}"
+}
+
+# Classify the running system as stable, testing, unstable or unknown.
+current_debian_suite() {
+  local codename stable_codename testing_codename
+  codename="$(debian_codename)"
+
+  case "${codename}" in
+    sid | unstable)
+      printf 'unstable\n'
+      return 0
+      ;;
+  esac
+
+  stable_codename="$(release_codename stable)"
+  testing_codename="$(release_codename testing)"
+
+  if [[ -n ${stable_codename} && ${codename} == "${stable_codename}" ]]; then
+    printf 'stable\n'
+  elif [[ -n ${testing_codename} && ${codename} == "${testing_codename}" ]]; then
+    printf 'testing\n'
+  else
+    # Fall back to the codenames known when this script was written.
+    case "${codename}" in
+      trixie | bookworm | bullseye | buster) printf 'stable\n' ;;
+      forky) printf 'testing\n' ;;
+      *) printf 'unknown\n' ;;
+    esac
+  fi
+}
+
+# Ask which Debian suite to provision. An explicit TARGET_SUITE from the
+# environment skips the prompt; a non-interactive run defaults to stable.
+choose_target_suite() {
+  local reply=''
+
+  if [[ -n ${TARGET_SUITE} ]]; then
+    info "using Debian ${TARGET_SUITE} from TARGET_SUITE"
+    return 0
+  fi
+
+  if ! is_interactive; then
+    warn "no terminal attached; provisioning Debian stable"
+    TARGET_SUITE=stable
+    return 0
+  fi
+
+  log "Select the Debian suite to provision"
+  info "1) stable (default)"
+  info "2) testing"
+  info "3) unstable (sid)"
+
+  while true; do
+    if ! read -r -p 'Choice [1-3, default 1]: ' reply; then
+      warn "no input; provisioning Debian stable"
+      TARGET_SUITE=stable
+      return 0
+    fi
+    case "${reply}" in
+      '' | 1) TARGET_SUITE=stable; return 0 ;;
+      2) TARGET_SUITE=testing; return 0 ;;
+      3) TARGET_SUITE=unstable; return 0 ;;
+      *) warn "please enter 1, 2, or 3" ;;
+    esac
+  done
+}
+
+# Back up the existing apt sources and replace them with a single deb822 file
+# pointing at the requested suite. Returns without changing anything when the
+# system is already on that suite.
+switch_apt_suite() {
+  local target="$1"
+  local current codename backup_dir tmp_source suite_line f
+
+  codename="$(debian_codename)"
+  current="$(current_debian_suite)"
+
+  if [[ ${current} == "${target}" ]]; then
+    info "already on Debian ${target} (${codename}); leaving apt sources unchanged"
+    return 0
+  fi
+
+  if [[ ${current} == unstable && ${target} == testing ]]; then
+    die "refusing to downgrade from Debian unstable (sid) to testing"
+  fi
+
+  if [[ ${current} == unknown ]]; then
+    warn "could not determine the current Debian suite (codename: ${codename:-unknown})"
+  else
+    info "current Debian suite: ${current} (${codename})"
+  fi
+
+  log "Migrating apt sources to Debian ${target}"
+  info "existing sources will be backed up under /var/backups"
+  if ! confirm "Replace the apt sources with Debian ${target} sources?"; then
+    die "suite migration to Debian ${target} was declined"
+  fi
+
+  sudo_run mkdir -p /var/backups /etc/apt/sources.list.d
+  backup_dir="$(sudo_run mktemp -d /var/backups/apt-sources.XXXXXX)"
+  info "backing up apt sources to ${backup_dir}"
+
+  for f in /etc/apt/sources.list \
+    /etc/apt/sources.list.d/*.list \
+    /etc/apt/sources.list.d/*.sources; do
+    [[ -e ${f} ]] || continue
+    sudo_run cp -a --parents -- "${f}" "${backup_dir}/"
+  done
+
+  # Remove the old definitions so apt does not mix stable and target suites.
+  sudo_run rm -f -- /etc/apt/sources.list
+  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -e ${f} ]] || continue
+    sudo_run rm -f -- "${f}"
+  done
+
+  # Unstable has no security suite of its own, so only the main archive is
+  # used there. Testing has both testing-updates and testing-security.
+  if [[ ${target} == testing ]]; then
+    suite_line='testing testing-updates'
+  else
+    suite_line='unstable'
+  fi
+
+  tmp_source="$(mktemp)"
+  {
+    printf 'Types: deb\n'
+    printf 'URIs: %s\n' "${DEBIAN_MIRROR}"
+    printf 'Suites: %s\n' "${suite_line}"
+    printf 'Components: main contrib non-free non-free-firmware\n'
+    printf 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg\n'
+
+    if [[ ${target} == testing ]]; then
+      printf '\n'
+      printf 'Types: deb\n'
+      printf 'URIs: %s\n' "${DEBIAN_SECURITY_MIRROR}"
+      printf 'Suites: testing-security\n'
+      printf 'Components: main contrib non-free non-free-firmware\n'
+      printf 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg\n'
+    fi
+  } > "${tmp_source}"
+
+  sudo_run install -D -m 644 "${tmp_source}" \
+    "/etc/apt/sources.list.d/debian-${target}.sources"
+  rm -f -- "${tmp_source}"
+
+  REBOOT_REQUIRED=true
+  info "apt sources now point at Debian ${target}"
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -390,6 +646,18 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Normalize and validate a suite selected through the environment. When it is
+# empty, choose_target_suite prompts during step 1.
+if [[ -n ${TARGET_SUITE} ]]; then
+  case "${TARGET_SUITE}" in
+    stable | testing) ;;
+    sid | unstable) TARGET_SUITE=unstable ;;
+    *)
+      usage_error "invalid TARGET_SUITE: ${TARGET_SUITE} (expected stable, testing or unstable)"
+      ;;
+  esac
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -463,10 +731,24 @@ ensure_dir "${BASESCRIPTS_DIR}/usable" \
 # 1. Update + packages
 # ---------------------------------------------------------------------------
 
+# Let the user pick the suite, then migrate before the main package install so
+# the packages below come from the requested suite.
+choose_target_suite
+if [[ ${TARGET_SUITE} != stable ]]; then
+  switch_apt_suite "${TARGET_SUITE}"
+fi
+
 log "Updating the base system"
-# Sync the package index and update installed packages.
+# Sync the package index and update installed packages. A suite migration
+# needs a full upgrade, which apt_full_upgrade handles.
 apt_get update
-apt_get -y upgrade
+apt_full_upgrade
+
+# apt-listbugs is useful on the rolling suites, where release-critical bugs are
+# more common. Install it after the upgrade so it does not interrupt it.
+if [[ ${TARGET_SUITE} != stable ]]; then
+  SUITE_PACKAGES+=(apt-listbugs)
+fi
 
 # Choose the fetch tool that this Debian release actually ships.
 if apt-cache show fastfetch >/dev/null 2>&1; then
@@ -476,12 +758,18 @@ elif apt-cache show neofetch >/dev/null 2>&1; then
 fi
 
 log "Installing packages (${#PACKAGES[@]})"
-# Install all packages in one transaction.
-apt_get install -y "${PACKAGES[@]}"
+# Install all packages in one transaction, skipping any that the target suite
+# does not provide.
+install_available_packages "${PACKAGES[@]}"
+
+if ((${#SUITE_PACKAGES[@]} > 0)); then
+  log "Installing suite-specific packages: ${SUITE_PACKAGES[*]}"
+  install_available_packages "${SUITE_PACKAGES[@]}"
+fi
 
 if ((${#OPTIONAL_PACKAGES[@]} > 0)); then
   log "Installing release-specific packages: ${OPTIONAL_PACKAGES[*]}"
-  apt_get install -y "${OPTIONAL_PACKAGES[@]}"
+  install_available_packages "${OPTIONAL_PACKAGES[@]}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -643,6 +931,11 @@ if [[ ${REMOVE_SELF} == true ]]; then
 fi
 
 printf '\n%s: done - maybe.\n' "${SCRIPT_NAME}"
+if [[ ${REBOOT_REQUIRED} == true ]]; then
+  printf '\n*** Reboot required: this system was migrated to Debian %s. ***\n' \
+    "${TARGET_SUITE}"
+  printf 'Reboot before using the desktop so the new kernel and libraries load.\n'
+fi
 printf 'Remember which platform you are on, then log out and back in so the\n'
 printf 'new shell, fonts and theme are picked up; the themer needs X running.\n'
 
