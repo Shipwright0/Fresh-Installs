@@ -124,6 +124,9 @@ readonly -a PACKAGES=(
   redshift
   flameshot
   trash-cli
+  rsync
+  nfs-common
+  cifs-utils
 
   # shell, build and general-purpose tools.
   zsh
@@ -145,6 +148,7 @@ readonly -a PACKAGES=(
   tmux
   remina
   fzf
+  tree-sitter-cli
 
   # Fonts, browsers, document and media applications.
   fonts-jetbrains-mono
@@ -900,14 +904,6 @@ if [[ ! -d "${HOME_DIR}/.oh-my-zsh" ]]; then
   fi
 else
   log "oh-my-zsh already installed"
-fi
-
-# Run the themer if it is executable.
-if [[ -x ${THEMER} ]]; then
-  log "Running the themer"
-  "${THEMER}" || warn "the themer exited non-zero; run it manually after logging in"
-else
-  warn "themer not executable, skipping: ${THEMER}"
 fi
 
 # ---------------------------------------------------------------------------
